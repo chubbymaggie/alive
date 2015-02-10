@@ -1,4 +1,4 @@
-# Copyright 2014 The ALIVe authors.
+# Copyright 2014 The Alive authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,17 @@
 
 import copy, operator
 from common import *
+from codegen import CVariable, CFieldAccess
+
+
+def allTyEqual(vars, Ty):
+  c = [vars[0].type.typevar == Ty]
+  for i in range(1, len(vars)):
+    c += [vars[0].type == vars[i].type]
+  return c
+
+def mkTyEqual(types):
+  return [types[0] == types[i] for i in range(1, len(types))]
 
 
 class Type:
@@ -278,10 +289,14 @@ class IntType(Type):
     return BoolVal(depth == 0)
 
   def getTypeConstraints(self):
-    # Integers are assumed to be up to 64 bits.
-    c = [self.typevar == Type.Int, self.bitsvar > 0, self.bitsvar <= 64]
+    c = [self.typevar == Type.Int]
     if self.defined:
       c += [self.bitsvar == self.getSize()]
+    else:
+      # Integers are assumed to be up to 64 bits.
+      # We bias towards 4/8 bits, as counterexamples become easier to understand
+      c += [Or(self.bitsvar == 8, self.bitsvar == 4,
+               And(self.bitsvar > 0, self.bitsvar <= 64))]
     return And(c)
 
 
@@ -412,8 +427,9 @@ class Value:
 
   def setName(self, name):
     self.name = name
-    self.type = copy.deepcopy(self.type)
-    self.type.setName(name)
+    if hasattr(self, 'type'):
+      self.type = copy.deepcopy(self.type)
+      self.type.setName(name)
     for attr in dir(self):
       a = getattr(self, attr)
       if isinstance(a, TypeFixedValue):
@@ -453,6 +469,13 @@ class Value:
           if isinstance(e, (Type, Value)):
             e.fixupTypes(types)
 
+  def countUsers(self, m):
+    for attr in dir(self):
+      a = getattr(self, attr)
+      if isinstance(a, Value):
+        name = a.getUniqueName()
+        m[name] = m.get(name, 0) + 1
+
 
 ################################
 class TypeFixedValue(Value):
@@ -480,7 +503,7 @@ class TypeFixedValue(Value):
     assert isinstance(other, TypeFixedValue)
     return self.smtvar == other.smtvar
 
-  def toSMT(self, defined, state, qvars):
+  def toSMT(self, defined, poison, state, qvars):
     return self.val
 
   def getTypeConstraints(self):
@@ -518,7 +541,7 @@ class Input(Value):
   def __repr__(self):
     return self.getName()
 
-  def toSMT(self, defined, state, qvars):
+  def toSMT(self, defined, poison, state, qvars):
     ptr = BitVec(self.name, self.type.getSize())
     # if we are dealing with an arbitrary pointer, assume it points to something
     # that can (arbitrarily) hold 7 elements.
@@ -531,6 +554,31 @@ class Input(Value):
       return ptr
 
     num_elems = 7
-    mem = BitVec('mem_' + self.name, block_size * num_elems)
-    state.addAlloca(ptr, mem, (block_size, num_elems, 1))
+    size = block_size * num_elems
+    mem = BitVec('mem_' + self.name, size)
+    state.addInputMem(ptr, mem, (block_size, num_elems, 1))
     return ptr
+
+  def register_types(self, manager):
+    if self.name[0] == 'C':
+      min = IntType()
+    else:
+      min = UnknownType()
+
+    manager.register_type(self, self.type, min)
+
+  def _ensure_constant(self):
+    name = self.getName()
+    if name[0] != 'C':
+      raise AliveError('Input {0} used in an expression'.format(name))
+
+  def get_APInt_or_u64(self, manager):
+    return self.get_APInt(manager)
+
+  def get_APInt(self, manager):
+    self._ensure_constant()
+    return manager.get_cexp(self).arr('getValue', [])
+
+  def get_Value(self, manager):
+    assert False
+    # this should have been called through the manager
