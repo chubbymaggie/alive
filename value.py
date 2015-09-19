@@ -1,4 +1,4 @@
-# Copyright 2014 The Alive authors.
+# Copyright 2014-2015 The Alive authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,20 @@ def allTyEqual(vars, Ty):
 
 def mkTyEqual(types):
   return [types[0] == types[i] for i in range(1, len(types))]
+
+def create_mem_if_needed(ptr, val, state, qvars):
+    # if we are dealing with an arbitrary pointer, assume it points to something
+    # that can (arbitrarily) hold 7 elements.
+    if isinstance(val.type, PtrType):
+      block_size = val.type.getSize()
+    elif isinstance(val.type, UnknownType) and val.type.myType == Type.Ptr:
+      block_size = val.type.types[Type.Ptr].getSize()
+    else:
+      return
+
+    num_elems = 7
+    size = block_size * num_elems
+    state.addInputMem(ptr, qvars, block_size, num_elems)
 
 
 class Type:
@@ -132,7 +146,7 @@ class UnknownType(Type):
     return self.types[self.myType].getUnderlyingType()
 
   def fixupTypes(self, types):
-    self.myType = types.evaluate(self.typevar).as_long()
+    self.myType = types.get_interp(self.typevar).as_long()
     self.types[self.myType].fixupTypes(types)
 
   def __eq__(self, other):
@@ -252,7 +266,7 @@ class IntType(Type):
     return self.bitsvar
 
   def fixupTypes(self, types):
-    size = types.evaluate(self.bitsvar).as_long()
+    size = types.get_interp(self.bitsvar).as_long()
     assert self.defined == False or self.size == size
     self.size = size
 
@@ -347,17 +361,14 @@ class PtrType(Type):
     return BoolVal(False)
 
   def fixupTypes(self, types):
-    self.size = types.evaluate(Int('ptrsize')).as_long()
+    self.size = get_ptr_size()
     self.type.fixupTypes(types)
 
   def ensureTypeDepth(self, depth):
     return BoolVal(False) if depth == 0 else self.type.ensureTypeDepth(depth-1)
 
   def getTypeConstraints(self):
-    # Pointers are assumed to be either 32 or 64 bits
-    v = Int('ptrsize')
-    return And(Or(v == 32, v == 64),
-               self.typevar == Type.Ptr,
+    return And(self.typevar == Type.Ptr,
                self.type.getTypeConstraints())
 
 
@@ -528,7 +539,7 @@ class TypeFixedValue(Value):
 
   def fixupTypes(self, types):
     self.v.fixupTypes(types)
-    self.val = types.evaluate(self.smtvar).as_long()
+    self.val = types.get_interp(self.smtvar).as_long()
 
 
 ################################
@@ -542,22 +553,9 @@ class Input(Value):
     return self.getName()
 
   def toSMT(self, defined, poison, state, qvars):
-    ptr = BitVec(self.name, self.type.getSize())
-    # if we are dealing with an arbitrary pointer, assume it points to something
-    # that can (arbitrarily) hold 7 elements.
-    if isinstance(self.type, PtrType):
-      block_size = self.type.getSize()
-    elif isinstance(self.type, UnknownType) and\
-         (self.type.myType == Type.Ptr or self.type.myType == Type.Unknown):
-      block_size = self.type.types[Type.Ptr].getSize()
-    else:
-      return ptr
-
-    num_elems = 7
-    size = block_size * num_elems
-    mem = BitVec('mem_' + self.name, size)
-    state.addInputMem(ptr, mem, (block_size, num_elems, 1))
-    return ptr
+    v = BitVec(self.name, self.type.getSize())
+    create_mem_if_needed(v, self, state, [])
+    return v
 
   def register_types(self, manager):
     if self.name[0] == 'C':

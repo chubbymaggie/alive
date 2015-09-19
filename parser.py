@@ -1,4 +1,4 @@
-# Copyright 2014 The Alive authors.
+# Copyright 2014-2015 The Alive authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -414,7 +414,7 @@ def parse_llvm(txt):
         if not isinstance(v, (Store, Unreachable)):
           BBs[bb][k] = v
     for i,v in identifiers.iteritems():
-      if not isinstance(v, Input):
+      if not isinstance(v, (Input, Ret)):
         skip_identifiers.add(i)
   else:
     identifiers = collections.OrderedDict()

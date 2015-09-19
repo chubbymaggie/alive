@@ -1,4 +1,4 @@
-# Copyright 2014 The Alive authors.
+# Copyright 2014-2015 The Alive authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,13 +36,50 @@ def getPtrAlignCnstr(ptr, align):
   return ptr & (align-1) == 0
 
 
+def defined_align_access(state, defined, access_size, req_align, aptr):
+  defined.append(aptr != 0)
+  must_access = []
+  for blck in state.ptrs:
+    ptr  = blck.ptr
+    size = blck.size()
+    inbounds = And(UGE(aptr, ptr), UGE((size - access_size)/8, aptr - ptr))
+    if req_align != 0 and size >= access_size:
+      # overestimating the alignment is undefined behavior.
+      defined.append(Implies(inbounds, blck.align >= req_align))
+    if access_size <= size:
+      must_access.append(inbounds if blck.isAlloca() else BoolVal(True))
+  defined.append(mk_or(must_access))
+  # load/store are cutpoints; record BB definedness
+  state.defined += defined
+
+
 ################################
+class MemInfo:
+  def __init__(self, ptr, ty, block_size, num_elems, align):
+    self.ptr = ptr
+    self.ty = ty
+    self.block_size = block_size
+    self.num_elems = num_elems
+    self.align = align
+
+  def isAlloca(self):
+    return self.ty == 'alloca'
+
+  def size(self):
+    return self.block_size * self.num_elems
+
+  def __eq__(self, b):
+    return self.ptr.eq(b.ptr)
+
+
 class State:
   def __init__(self):
     self.vars = collections.OrderedDict()
     self.defined = [] # definedness so far in the BB
     self.ptrs = []
+    self.mem_qvars = []
     self.bb_pres = {}
+    self.bb_mem = {}
 
   def add(self, v, smt, defined, poison, qvars):
     if v.getUniqueName() == '':
@@ -53,24 +90,62 @@ class State:
         bb = bb[1:]
         if bb not in self.bb_pres:
           self.bb_pres[bb] = []
+          self.bb_mem[bb] = []
         self.bb_pres[bb] += [cond]
+        self.bb_mem[bb].append((cond, self.mem))
 
-  def addAlloca(self, ptr, mem, info):
-    self.ptrs += [(ptr, mem, [mem], info)]
+  def addAlloca(self, ptr, mem, block_size, num_elems, align):
+    self.mem_qvars.append(mem)
+    self.ptrs.append(MemInfo(ptr, 'alloca', block_size, num_elems, align))
 
-  def addInputMem(self, ptr, mem, info):
-    self.ptrs += [(ptr, mem, [], info)]
+  def addInputMem(self, ptr, qvars, block_size, num_elems):
+    # precondition vcgen can call this function spuriously
+    if any(ptr.eq(blck.ptr) for blck in self.ptrs):
+      return
+    self.mem_qvars += qvars
+    self.ptrs.append(MemInfo(ptr, 'in', block_size, num_elems, 1))
+
+  def store(self, cnstr, idx, val):
+    if use_array_theory():
+      self.mem = mk_if(mk_and(cnstr), Update(self.mem, idx, val), self.mem)
+    else:
+      self.mem = If(mk_and(cnstr + [self.idx_var == idx]), val, self.mem)
+
+  def load(self, idx):
+    if use_array_theory():
+      return self.mem[idx]
+    return substitute(self.mem, (self.idx_var, idx))
 
   def newBB(self, name):
     if name in self.bb_pres:
       self.defined = [mk_or(self.bb_pres[name])]
+      self.mem = fold_ite_list(self.bb_mem[name])
     else:
       self.defined = []
+      if use_array_theory():
+        self.mem = Array('mem0', BitVecSort(get_ptr_size()), BitVecSort(8))
+      else:
+        self.mem = BitVec('mem0', 8)
+        self.idx_var = BitVec('idx', get_ptr_size())
     self.current_bb = name
 
   def getAllocaConstraints(self):
-    ptrs = [ptr for (ptr, mem, qvars, info) in self.ptrs]
-    return [mk_distinct(ptrs)]
+    # generate the following constraints:
+    # 1) Alloca ptrs are never null
+    # 2) Allocated regions do not overlap with each other and with input blocks
+    cnstr = []
+    for mem1 in self.ptrs:
+      if mem1.ty == 'in':
+        continue
+      ptr = mem1.ptr
+      size = mem1.size()
+      cnstr.append(ptr != 0)
+      for mem2 in self.ptrs:
+        if mem1 == mem2:
+          continue
+        cnstr.append(Or(UGE(mem2.ptr, ptr + size),
+                        ULE(mem2.ptr + mem2.size(), ptr)))
+    return cnstr
 
   def eval(self, v, defined, poison, qvars):
     (smt, d, p, q) = self.vars[v.getUniqueName()]
@@ -238,7 +313,10 @@ class BinOp(Instr):
                 },
       self.URem:{},
       self.SRem:{},
-      self.Shl: {'nsw': lambda a,b: (a << b) >> b == a,
+      self.Shl: {'nsw': lambda a,b: Or((a << b) >> b == a,
+                                       And(a == 1, b == (bits-1)))
+                                    if use_new_semantics()
+                                    else (a << b) >> b == a,
                  'nuw': lambda a,b: LShR(a << b, b) == a,
                 },
       self.AShr:{'exact': lambda a,b: (a >> b) << b == a,
@@ -768,12 +846,17 @@ class Alloca(Instr):
       qvars.append(ptr)
       return ptr
 
-    defined += [ULT(ptr, ptr + (size >> 3)),
-                ptr != 0,
+    if size > 8:
+      defined.append(ULT(ptr, ptr + ((size >> 3) - 1)))
+    defined += [ptr != 0,
                 getPtrAlignCnstr(ptr, self.align)]
 
     mem = freshBV('alloca' + self.getName(), size)
-    state.addAlloca(ptr, mem, (block_size, num_elems, self.align))
+    state.addAlloca(ptr, mem, block_size, num_elems, self.align)
+
+    for i in range(0, size/8):
+      idx = 8*i
+      state.store([], ptr + i, Extract(idx+7, idx, mem))
     return ptr
 
   def getTypeConstraints(self):
@@ -847,48 +930,23 @@ class Load(Instr):
   def getOpName(self):
     return 'load'
 
-  def extractBV(self, BV, offset, size):
-    old_size = BV.size()
-    BV = BV << offset
-    return Extract(old_size - 1, old_size - size, BV)
-
-  def _recPtrLoad(self, l, v, defined, mustload, qvars):
-    if len(l) == 0:
-      return None
-
-    (ptr, mem, qvs, info) = l[0]
-    (block_size, num_elems, align) = info
-    size = mem.size()
-    read_size = self.type.getSize()
-    actual_read_size = getAllocSize(self.type)
-
-    if size > read_size:
-      offset = truncateOrZExt((v - ptr) << 3, mem)
-      mem = self.extractBV(mem, offset, read_size)
-    elif size < read_size:
-      # undef behavior; skip this block
-      return self._recPtrLoad(l[1:], v, defined, mustload, qvars)
-
-    inbounds = And(UGE(v, ptr), UGE((size - read_size)/8, v - ptr))
-    mustload += [inbounds]
-    qvars += qvs
-
-    if self.align != 0:
-      # overestimating the alignment is undefined behavior.
-      defined += [Implies(inbounds, align >= self.align)]
-
-    mem2 = self._recPtrLoad(l[1:], v, defined, mustload, qvars)
-    return mem if mem2 is None else If(inbounds, mem, mem2)
-
   def toSMT(self, defined, poison, state, qvars):
-    v = state.eval(self.v, defined, poison, qvars)
-    mustload = []
-    val = self._recPtrLoad(state.ptrs, v, defined, mustload, qvars)
-    defined += [v != 0, mk_or(mustload)]
-    if val is None:
-      defined.append(BoolVal(False))
-      return BitVecVal(0, self.type.getSize())
-    return val
+    qvars += state.mem_qvars
+    ptr = state.eval(self.v, defined, poison, qvars)
+    access_sz = getAllocSize(self.type)
+    defined_align_access(state, defined, access_sz, self.align, ptr)
+
+    bytes = []
+    sz = self.type.getSize()
+    rem = sz % 8
+    if rem != 0:
+      sz = sz - rem
+      bytes = [Extract(rem-1, 0, state.load(ptr))]
+      ptr += 1
+    for i in range(0, sz/8):
+      # FIXME: assumes little-endian
+      bytes = [state.load(ptr + i)] + bytes
+    return mk_concat(bytes)
 
   def getTypeConstraints(self):
     return And(self.stype == self.v.type,
@@ -927,53 +985,31 @@ class Store(Instr):
     return 'store %s%s, %s %s%s' % (t, self.src.getName(), str(self.type),
                                     self.dst.getName(), align)
 
-  def _mkMem(self, src, tgt, ptr, size, mem):
-    write_size = self.stype.getSize()
-    if write_size == size:
-      return src
-    offset = (tgt - ptr) << 3
-    new = LShR(truncateOrPad(src, mem), truncateOrZExt(offset, mem))
-
-    # mask out bits that will be written
-    mask = BitVecVal((1 << size) - 1, size)
-    m1 = mask << truncateOrZExt(size - offset, mem)
-    m2 = LShR(mask, truncateOrZExt(write_size + offset, mem))
-    old = mem & (m1 | m2)
-    return new | old
-
   def toSMT(self, defined, poison, state, qvars):
     qvars_new = []
     src = state.eval(self.src, defined, poison, qvars_new)
     tgt = state.eval(self.dst, defined, poison, qvars_new)
     qvars += qvars_new
+    state.mem_qvars += qvars_new
 
+    src_size = self.stype.getSize()
     write_size = getAllocSize(self.stype)
-    newmem = []
-    mustwrite = []
-    for (ptr, mem, qvs, info) in state.ptrs:
-      (block_size, num_elems, align) = info
-      size = block_size * num_elems
-      # skip block if it is too small
-      if size < write_size:
-        newmem += [(ptr, mem, qvs, info)]
-        continue
+    defined_align_access(state, defined, write_size, self.align, tgt)
 
-      inbounds = And(UGE(tgt, ptr), UGE((size - write_size)/8, tgt - ptr))
-      mustwrite += [inbounds]
-
-      writes = mk_and(state.defined + [inbounds])
-      mem = If(writes, self._mkMem(src, tgt, ptr, size, mem), mem)
-      qvs += qvars_new
-      newmem += [(ptr, mem, qvs, (block_size, num_elems, align))]
-
-      if self.align != 0:
-        # overestimating the alignment is undefined behavior.
-        defined += [Implies(inbounds, align >= self.align)]
-
-    state.ptrs = newmem
-    defined += [tgt != 0, mk_or(mustwrite)]
-    # cutpoint; record BB definedness
-    state.defined = state.defined + defined
+    src_idx = 0
+    # FIXME: assumes little-endian
+    if src_size != write_size:
+      rem = src_size % 8
+      rest = Extract(rem-1, 0, src)
+      rest_old = Extract(7, rem, state.load(tgt))
+      state.store(state.defined, tgt, Concat(rest_old, rest))
+      tgt += 1
+      write_size -= 8
+      assert (src_size-rem) == write_size
+      src_idx = rem
+    for i in range(0, write_size/8):
+      state.store(state.defined, tgt+i, Extract(src_idx+7, src_idx, src))
+      src_idx += 8
     return None
 
   def getTypeConstraints(self):
